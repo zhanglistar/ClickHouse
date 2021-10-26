@@ -9,7 +9,8 @@
 
 #include <boost/algorithm/string.hpp>
 
-#include <common/unit.h>
+#include <base/unit.h>
+#include <base/FnTraits.h>
 
 #include <Common/checkStackSize.h>
 #include <Common/createHardLink.h>
@@ -74,7 +75,7 @@ public:
         chunks.back().push_back(obj);
     }
 
-    void removePaths(const std::function<void(Chunk &&)> & remove_chunk_func)
+    void removePaths(Fn<void(Chunk &&)> auto && remove_chunk_func)
     {
         for (auto & chunk : chunks)
             remove_chunk_func(std::move(chunk));
@@ -221,7 +222,7 @@ void DiskS3::moveFile(const String & from_path, const String & to_path, bool sen
     fs::rename(fs::path(metadata_path) / from_path, fs::path(metadata_path) / to_path);
 }
 
-std::unique_ptr<ReadBufferFromFileBase> DiskS3::readFile(const String & path, const ReadSettings & read_settings, size_t) const
+std::unique_ptr<ReadBufferFromFileBase> DiskS3::readFile(const String & path, const ReadSettings & read_settings, std::optional<size_t>) const
 {
     auto settings = current_settings.get();
     auto metadata = readMeta(path);

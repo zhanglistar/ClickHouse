@@ -34,7 +34,7 @@ void KeeperDispatcher::requestThread()
 
     while (!shutdown_called)
     {
-        KeeperStorage::RequestForSession request;
+        //KeeperStorage::RequestForSession request;
 
         UInt64 max_wait = UInt64(coordination_settings->operation_timeout_ms.totalMilliseconds());
         uint64_t max_batch_size = coordination_settings->max_requests_batch_size;
@@ -47,83 +47,87 @@ void KeeperDispatcher::requestThread()
         /// read request. So reads are some kind of "separator" for writes.
         try
         {
-            if (requests_queue->tryPop(request, max_wait))
+            std::vector<KeeperStorage::RequestForSession> requests;
+            if (requests_queue->tryPopMany(requests, max_batch_size, max_wait))
             {
                 if (shutdown_called)
                     break;
 
-                KeeperStorage::RequestsForSessions current_batch;
-
-                bool has_read_request = false;
-
-                /// If new request is not read request or we must to process it through quorum.
-                /// Otherwise we will process it locally.
-                if (coordination_settings->quorum_reads || !request.request->isReadRequest())
+                for (auto & request : requests)
                 {
-                    current_batch.emplace_back(request);
+                    KeeperStorage::RequestsForSessions current_batch;
 
-                    /// Waiting until previous append will be successful, or batch is big enough
-                    /// has_result == false && get_result_code == OK means that our request still not processed.
-                    /// Sometimes NuRaft set errorcode without setting result, so we check both here.
-                    while (prev_result && (!prev_result->has_result() && prev_result->get_result_code() == nuraft::cmd_result_code::OK) && current_batch.size() <= max_batch_size)
+                    bool has_read_request = false;
+
+                    /// If new request is not read request or we must to process it through quorum.
+                    /// Otherwise we will process it locally.
+                    if (coordination_settings->quorum_reads || !request.request->isReadRequest())
                     {
-                        /// Trying to get batch requests as fast as possible
-                        if (requests_queue->tryPop(request, 1))
-                        {
-                            /// Don't append read request into batch, we have to process them separately
-                            if (!coordination_settings->quorum_reads && request.request->isReadRequest())
-                            {
-                                has_read_request = true;
-                                break;
-                            }
-                            else
-                            {
+                        current_batch.emplace_back(request);
 
-                                current_batch.emplace_back(request);
+                        /// Waiting until previous append will be successful, or batch is big enough
+                        /// has_result == false && get_result_code == OK means that our request still not processed.
+                        /// Sometimes NuRaft set errorcode without setting result, so we check both here.
+                        while (prev_result && (!prev_result->has_result() && prev_result->get_result_code() == nuraft::cmd_result_code::OK)
+                               && current_batch.size() <= max_batch_size)
+                        {
+                            /// Trying to get batch requests as fast as possible
+                            if (requests_queue->tryPop(request, 1))
+                            {
+                                /// Don't append read request into batch, we have to process them separately
+                                if (!coordination_settings->quorum_reads && request.request->isReadRequest())
+                                {
+                                    has_read_request = true;
+                                    break;
+                                }
+                                else
+                                {
+                                    current_batch.emplace_back(request);
+                                }
                             }
+
+                            if (shutdown_called)
+                                break;
+                        }
+                    }
+                    else
+                        has_read_request = true;
+
+                    if (shutdown_called)
+                        break;
+
+                    /// Forcefully process all previous pending requests
+                    if (prev_result)
+                        forceWaitAndProcessResult(prev_result, prev_batch);
+
+                    /// Process collected write requests batch
+                    if (!current_batch.empty())
+                    {
+                        auto result = server->putRequestBatch(current_batch);
+
+                        if (result)
+                        {
+                            if (has_read_request) /// If we will execute read request next, than we have to process result now
+                                forceWaitAndProcessResult(result, current_batch);
+                        }
+                        else
+                        {
+                            addErrorResponses(current_batch, Coordination::Error::ZCONNECTIONLOSS);
+                            current_batch.clear();
                         }
 
-                        if (shutdown_called)
-                            break;
+                        prev_batch = current_batch;
+                        prev_result = result;
                     }
-                }
-                else
-                    has_read_request = true;
 
-                if (shutdown_called)
-                    break;
-
-                /// Forcefully process all previous pending requests
-                if (prev_result)
-                    forceWaitAndProcessResult(prev_result, prev_batch);
-
-                /// Process collected write requests batch
-                if (!current_batch.empty())
-                {
-                    auto result = server->putRequestBatch(current_batch);
-
-                    if (result)
+                    /// Read request always goes after write batch (last request)
+                    if (has_read_request)
                     {
-                        if (has_read_request) /// If we will execute read request next, than we have to process result now
-                            forceWaitAndProcessResult(result, current_batch);
+                        if (server->isLeaderAlive())
+                            server->putLocalReadRequest(request);
+                        else
+                            addErrorResponses({request}, Coordination::Error::ZCONNECTIONLOSS);
                     }
-                    else
-                    {
-                        addErrorResponses(current_batch, Coordination::Error::ZCONNECTIONLOSS);
-                        current_batch.clear();
-                    }
-
-                    prev_batch = current_batch;
-                    prev_result = result;
-                }
-
-                /// Read request always goes after write batch (last request)
-                if (has_read_request)
-                {
-                    if (server->isLeaderAlive())
-                        server->putLocalReadRequest(request);
-                    else
-                        addErrorResponses({request}, Coordination::Error::ZCONNECTIONLOSS);
                 }
             }
         }
@@ -150,7 +154,7 @@ void KeeperDispatcher::responseThread()
 
             try
             {
-                 setResponse(response_for_session.session_id, response_for_session.response);
+                setResponse(response_for_session.session_id, response_for_session.response);
             }
             catch (...)
             {
@@ -190,7 +194,8 @@ void KeeperDispatcher::setResponse(int64_t session_id, const Coordination::ZooKe
     /// Special new session response.
     if (response->xid != Coordination::WATCH_XID && response->getOpNum() == Coordination::OpNum::SessionID)
     {
-        const Coordination::ZooKeeperSessionIDResponse & session_id_resp = dynamic_cast<const Coordination::ZooKeeperSessionIDResponse &>(*response);
+        const Coordination::ZooKeeperSessionIDResponse & session_id_resp
+            = dynamic_cast<const Coordination::ZooKeeperSessionIDResponse &>(*response);
 
         /// Nobody waits for this session id
         if (session_id_resp.server_id != server->getServerID() || !new_session_id_response_callback.count(session_id_resp.internal_id))
@@ -262,8 +267,7 @@ void KeeperDispatcher::initialize(const Poco::Util::AbstractConfiguration & conf
     responses_thread = ThreadFromGlobalPool([this] { responseThread(); });
     snapshot_thread = ThreadFromGlobalPool([this] { snapshotThread(); });
 
-    server = std::make_unique<KeeperServer>(
-        myid, coordination_settings, config, responses_queue, snapshots_queue, standalone_keeper);
+    server = std::make_unique<KeeperServer>(myid, coordination_settings, config, responses_queue, snapshots_queue, standalone_keeper);
 
     try
     {
@@ -388,7 +392,8 @@ void KeeperDispatcher::sessionCleanerTask()
                     LOG_INFO(log, "Found dead session {}, will try to close it", dead_session);
 
                     /// Close session == send close request to raft server
-                    Coordination::ZooKeeperRequestPtr request = Coordination::ZooKeeperRequestFactory::instance().get(Coordination::OpNum::Close);
+                    Coordination::ZooKeeperRequestPtr request
+                        = Coordination::ZooKeeperRequestFactory::instance().get(Coordination::OpNum::Close);
                     request->xid = Coordination::CLOSE_XID;
                     KeeperStorage::RequestForSession request_info;
                     request_info.request = request;
@@ -432,7 +437,8 @@ void KeeperDispatcher::addErrorResponses(const KeeperStorage::RequestsForSession
         response->zxid = 0;
         response->error = error;
         if (!responses_queue.push(DB::KeeperStorage::ResponseForSession{session_id, response}))
-            throw Exception(ErrorCodes::SYSTEM_ERROR,
+            throw Exception(
+                ErrorCodes::SYSTEM_ERROR,
                 "Could not push error response xid {} zxid {} error message {} to responses queue",
                 response->xid,
                 response->zxid,
@@ -475,24 +481,30 @@ int64_t KeeperDispatcher::getSessionID(int64_t session_timeout_ms)
 
     {
         std::lock_guard lock(session_to_response_callback_mutex);
-        new_session_id_response_callback[request->internal_id] = [promise, internal_id = request->internal_id] (const Coordination::ZooKeeperResponsePtr & response)
-        {
-            if (response->getOpNum() != Coordination::OpNum::SessionID)
-                promise->set_exception(std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
-                            "Incorrect response of type {} instead of SessionID response", Coordination::toString(response->getOpNum()))));
+        new_session_id_response_callback[request->internal_id]
+            = [promise, internal_id = request->internal_id](const Coordination::ZooKeeperResponsePtr & response) {
+                  if (response->getOpNum() != Coordination::OpNum::SessionID)
+                      promise->set_exception(std::make_exception_ptr(Exception(
+                          ErrorCodes::LOGICAL_ERROR,
+                          "Incorrect response of type {} instead of SessionID response",
+                          Coordination::toString(response->getOpNum()))));
 
-            auto session_id_response = dynamic_cast<const Coordination::ZooKeeperSessionIDResponse &>(*response);
-            if (session_id_response.internal_id != internal_id)
-            {
-                promise->set_exception(std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
-                            "Incorrect response with internal id {} instead of {}", session_id_response.internal_id, internal_id)));
-            }
+                  auto session_id_response = dynamic_cast<const Coordination::ZooKeeperSessionIDResponse &>(*response);
+                  if (session_id_response.internal_id != internal_id)
+                  {
+                      promise->set_exception(std::make_exception_ptr(Exception(
+                          ErrorCodes::LOGICAL_ERROR,
+                          "Incorrect response with internal id {} instead of {}",
+                          session_id_response.internal_id,
+                          internal_id)));
+                  }
 
-            if (response->error != Coordination::Error::ZOK)
-                promise->set_exception(std::make_exception_ptr(zkutil::KeeperException("SessionID request failed with error", response->error)));
+                  if (response->error != Coordination::Error::ZOK)
+                      promise->set_exception(
+                          std::make_exception_ptr(zkutil::KeeperException("SessionID request failed with error", response->error)));
 
-            promise->set_value(session_id_response.session_id);
-        };
+                  promise->set_value(session_id_response.session_id);
+              };
     }
 
     /// Push new session request to queue
@@ -548,7 +560,10 @@ void KeeperDispatcher::updateConfigurationThread()
                 {
                     done = server->waitConfigurationUpdate(action);
                     if (!done)
-                        LOG_INFO(log, "Cannot wait for configuration update, maybe we become leader, or maybe update is invalid, will try to wait one more time");
+                        LOG_INFO(
+                            log,
+                            "Cannot wait for configuration update, maybe we become leader, or maybe update is invalid, will try to wait "
+                            "one more time");
                 }
             }
         }

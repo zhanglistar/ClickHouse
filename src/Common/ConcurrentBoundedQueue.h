@@ -58,6 +58,42 @@ private:
         return true;
     }
 
+    bool popManyImpl(std::vector<T> & res, int n, std::optional<UInt64> timeout_milliseconds)
+    {
+        {
+            std::unique_lock<std::mutex> queue_lock(queue_mutex);
+
+            auto predicate = [&]() { return is_finished || !queue.empty(); };
+
+            if (timeout_milliseconds.has_value())
+            {
+                bool wait_result = pop_condition.wait_for(queue_lock, std::chrono::milliseconds(timeout_milliseconds.value()), predicate);
+
+                if (!wait_result)
+                    return false;
+            }
+            else
+            {
+                pop_condition.wait(queue_lock, predicate);
+            }
+
+            if (is_finished && queue.empty())
+                return false;
+
+            for (int i = 0; i < n; ++i)
+            {
+                if (queue.empty())
+                    break;
+                T x;
+                detail::moveOrCopyIfThrow(std::move(queue.front()), x);
+                queue.pop();
+                res[i] = x;
+            }
+        }
+        push_condition.notify_one();
+        return true;
+    }
+
     bool popImpl(T & x, std::optional<UInt64> timeout_milliseconds)
     {
         {
@@ -131,6 +167,12 @@ public:
     [[nodiscard]] bool tryPop(T & x, UInt64 milliseconds = 0)
     {
         return popImpl(x, milliseconds);
+    }
+
+    /// Returns false if queue is (finished and empty) or (object was not popped during timeout)
+    [[nodiscard]] bool tryPopMany(std::vector<T> & res, int n, UInt64 milliseconds = 0)
+    {
+        return popManyImpl(res, n, milliseconds);
     }
 
     /// Returns size of queue
